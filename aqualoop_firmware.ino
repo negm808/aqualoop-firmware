@@ -1,532 +1,238 @@
-/*
- * ============================================================
- *  AquaLoop — ESP32 Firmware v3.0 (Real Sensors)
- * ============================================================
- */
+// ============================================================
+//  AquaLoop ESP32 - SMART SIMULATION & HYBRID AUTOMATION (v6.0)
+// ============================================================
 
 #include <ArduinoJson.h>
-#include <BH1750.h>
-#include <DallasTemperature.h>
-#include <OneWire.h>
-#include <WebSocketsClient.h>
-#include <WiFi.h>
-#include <Wire.h>
 
-const char *WIFI_SSID = "negm";
-const char *WIFI_PASSWORD = "abdonegm";
-const char *SERVER_HOST =
-    "browsers-naturals-subsidiary-areas.trycloudflare.com";
-                                             // (without https://)
-const int SERVER_PORT = 443;
-const char *SERVER_PATH = "/ws/sensors";
+// ─── PIN DEFINITIONS ────────────────────────────────────────
+#define PIN_TDS_SENSOR   35   
+#define PIN_LUX_SENSOR   32   
+#define PIN_PUMP_6V      33   
+#define PIN_PUMP_12V     26   
+#define PIN_LED          27   
 
-#define PH_PIN 34
-#define TDS_PIN 35
-#define TEMP_PIN 4
-#define PUMP_1_PIN 33
-#define PUMP_2_PIN 26
-#define DILUTED_PUMP_PIN 25
-#define LED_PIN 27
-#define RELAY_ON HIGH
-#define RELAY_OFF LOW
+// --- RELAY SETTINGS (Active-Low Logic) ---
+#define PUMP_ON    LOW
+#define PUMP_OFF   HIGH
+#define LED_ON     LOW
+#define LED_OFF    HIGH
 
-#define ADC_DISCONNECTED_LOW 50
-#define ADC_DISCONNECTED_HIGH 4040
-#define ADC_SAMPLES 30
-#define ADC_SAMPLE_DELAY_MS 5
-#define SENSOR_INTERVAL_MS 5000
-#define TEMP_REQUEST_DELAY_MS 750
-#define WIFI_TIMEOUT_MS 30000
+const int BAUD_RATE = 115200;
+const unsigned long SEND_INTERVAL = 5000UL; 
 
-float PH_VOLTAGE_AT_4 = 3.00;
-float PH_VOLTAGE_AT_7 = 2.50;
-float TDS_CALIBRATION_FACTOR = 0.5;
+// ─── PH SIMULATION PROFILES ────────────────────────────────
+struct PhSimProfile {
+  float startPH;
+  float lowPH;
+  float highPH;
+  float rateDec; // units per sec
+  float rateInc; // units per sec (net)
+};
 
-BH1750 lightMeter;
-OneWire oneWire(TEMP_PIN);
-DallasTemperature tempSensor(&oneWire);
-WebSocketsClient webSocket;
-bool wsConnected = false;
+const PhSimProfile PH_SIM[3] = {
+  // MAIN: 7.5 -> 6.5 (8 min), 6.5 -> 7.5 (5 min)
+  { 7.5f, 6.5f, 7.5f, (7.5f-6.5f)/(8.0f*60.0f), (7.5f-6.5f)/(5.0f*60.0f) },
+  // DB1: 6.9 -> 5.4 (8 min), 5.4 -> 6.8 (5 min)
+  { 6.9f, 5.4f, 6.8f, (6.9f-5.4f)/(8.0f*60.0f), (6.8f-5.4f)/(5.0f*60.0f) },
+  // DB2: 7.2 -> 5.9 (8 min), 5.9 -> 7.2 (5 min)
+  { 7.2f, 5.9f, 7.2f, (7.2f-5.9f)/(8.0f*60.0f), (7.2f-5.9f)/(5.0f*60.0f) }
+};
 
-struct Actuator {
-  int pin;
+// ─── SYSTEM DEFINITIONS ─────────────────────────────────────
+struct SystemSetpoints {
+  const char *id;
+  int tdsMin; int tdsMax;
+  int luxMin; int luxMax;
+};
+
+const SystemSetpoints SYSTEMS[3] = {
+  { "main", 20,  700, 13500, 16500 }, 
+  { "db1",  700, 1200, 16000, 20000 },
+  { "db2",  600, 1000, 14000, 18000 }
+};
+
+// ─── GLOBAL STATE ────────────────────────────────────────────
+int  activeSystemIndex = 0;
+bool identified        = false;
+bool triggerCycle      = false;
+
+struct ActuatorState {
   bool state;
   bool manual;
+  bool silenced;
 };
 
-Actuator pump1 = {PUMP_1_PIN, false, false};
-Actuator pump2 = {PUMP_2_PIN, false, false};
-Actuator dilutedPump = {DILUTED_PUMP_PIN, false, false};
-Actuator led = {LED_PIN, false, false};
+ActuatorState pump6v = {false, false, false};
+ActuatorState pump12v = {false, false, false};
+ActuatorState led = {false, false, false};
 
-struct Profile {
-  float ph_min, ph_max;
-  float tds_min, tds_max;
-  float lux_min, lux_max;
-};
+float  simPH[3];
+enum SimPhase { DECREASING, INCREASING };
+SimPhase currentPhase[3] = {DECREASING, DECREASING, DECREASING};
 
-Profile profiles[3] = {
-    {7.0, 7.5, 300, 700, 13500, 16500},
-    {6.0, 7.0, 700, 1200, 16000, 20000},
-    {6.5, 7.5, 600, 1000, 14000, 18000},
-};
-const char *profileNames[3] = {"main", "db1", "db2"};
-int activeIndex = 0;
-Profile *current = &profiles[0];
+unsigned long lastPhUpdate;
+unsigned long lastSendTime = 0;
 
-// ── WiFi ──────────────────────────────────────────────────────
-void printWiFiStatus(wl_status_t s) {
-  switch (s) {
-  case WL_NO_SSID_AVAIL:
-    Serial.println("[WiFi] ERROR: SSID not found");
-    break;
-  case WL_CONNECT_FAILED:
-    Serial.println("[WiFi] ERROR: Wrong password");
-    break;
-  case WL_CONNECTION_LOST:
-    Serial.println("[WiFi] ERROR: Connection lost");
-    break;
-  case WL_DISCONNECTED:
-    Serial.println("[WiFi] ERROR: Disconnected");
-    break;
-  default:
-    Serial.printf("[WiFi] ERROR: Status code %d\n", s);
-    break;
-  }
-}
+// ─── SENSORS ────────────────────────────────────────────────
+int readTDS() { return 450; } // Simulated for now
+int readLux() { return 15000; } // Simulated for now
 
-bool connectWiFi() {
-  Serial.println("\n[WiFi] --- Connection Attempt ---");
-  Serial.print("[WiFi] SSID: ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.setHostname("AquaLoop-ESP32");
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start >= WIFI_TIMEOUT_MS) {
-      Serial.println("\n[WiFi] FAILED: Timeout reached (30s)");
-      printWiFiStatus(WiFi.status());
-      return false;
-    }
-    delay(500);
-    Serial.print(".");
-    if ((millis() - start) % 5000 == 0) {
-      Serial.printf(" [%ds] ", (int)((millis() - start) / 1000));
-    }
-  }
-
-  Serial.println("\n[WiFi] SUCCESS!");
-  Serial.print("[WiFi] IP Address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("[WiFi] RSSI: ");
-  Serial.print(WiFi.RSSI());
-  Serial.println(" dBm");
-  return true;
-}
-
-// ── Actuators ─────────────────────────────────────────────────
-void applyActuator(Actuator &a) {
-  digitalWrite(a.pin, a.state ? RELAY_ON : RELAY_OFF);
-}
-
-Actuator *getActuatorByName(const char *name) {
-  if (strcmp(name, "pump1") == 0)
-    return &pump1;
-  if (strcmp(name, "pump2") == 0)
-    return &pump2;
-  if (strcmp(name, "diluted_pump") == 0)
-    return &dilutedPump;
-  if (strcmp(name, "led") == 0)
-    return &led;
-  return nullptr;
-}
-
-// ── Sensors ───────────────────────────────────────────────────
-float readAnalogAveraged(int pin) {
-  long sum = 0;
-  for (int i = 0; i < ADC_SAMPLES; i++) {
-    sum += analogRead(pin);
-    delay(ADC_SAMPLE_DELAY_MS);
-  }
-  float avg = sum / (float)ADC_SAMPLES;
-  if (avg < ADC_DISCONNECTED_LOW || avg > ADC_DISCONNECTED_HIGH)
-    return -1.0;
-  return avg;
-}
-
-float readPH() {
-  float raw = readAnalogAveraged(PH_PIN);
-  if (raw < 0)
-    return -1.0;
-  float voltage = raw * (3.3 / 4095.0);
-  float slope = (7.0 - 4.0) / (PH_VOLTAGE_AT_7 - PH_VOLTAGE_AT_4);
-  return constrain(7.0 + slope * (voltage - PH_VOLTAGE_AT_7), 0.0, 14.0);
-}
-
-float readTDS() {
-  float raw = readAnalogAveraged(TDS_PIN);
-  if (raw < 0)
-    return -1.0;
-  float voltage = raw * (3.3 / 4095.0);
-  float tds =
-      (133.42 * pow(voltage, 3) - 255.86 * pow(voltage, 2) + 857.39 * voltage) *
-      TDS_CALIBRATION_FACTOR;
-  return constrain(tds, 0.0, 2000.0);
-}
-
-float readLight() {
-  float lux = lightMeter.readLightLevel();
-  if (lux < 0)
-    return -1.0;
-  return lux;
-}
-
-float readTemperature() {
-  tempSensor.requestTemperatures();
-  delay(TEMP_REQUEST_DELAY_MS);
-  float t = tempSensor.getTempCByIndex(0);
-  if (t <= -100.0)
-    return -1.0;
-  return t;
-}
-
-// ── WebSocket sends ───────────────────────────────────────────
-void sendActuatorStatus() {
-  StaticJsonDocument<512> doc;
+// ─── ACTUATORS ──────────────────────────────────────────────
+void sendActuatorStatus(const char *act, bool on) {
+  StaticJsonDocument<128> doc;
   doc["type"] = "actuator_status";
-  doc["actuators"]["pump1"]["state"] = pump1.state ? "on" : "off";
-  doc["actuators"]["pump1"]["mode"] = pump1.manual ? "manual" : "auto";
-  doc["actuators"]["pump2"]["state"] = pump2.state ? "on" : "off";
-  doc["actuators"]["pump2"]["mode"] = pump2.manual ? "manual" : "auto";
-  doc["actuators"]["diluted_pump"]["state"] = dilutedPump.state ? "on" : "off";
-  doc["actuators"]["diluted_pump"]["mode"] =
-      dilutedPump.manual ? "manual" : "auto";
-  doc["actuators"]["led"]["state"] = led.state ? "on" : "off";
-  doc["actuators"]["led"]["mode"] = led.manual ? "manual" : "auto";
-  String output;
-  serializeJson(doc, output);
-  webSocket.sendTXT(output);
+  doc["actuator"] = act;
+  doc["state"] = on ? "on" : "off";
+  serializeJson(doc, Serial); Serial.println();
 }
 
-void sendSensorReading(float ph, float tds, float light, float temp) {
-  DynamicJsonDocument doc(1024);
-  doc["type"] = "sensor_reading";
-  doc["system"] = activeIndex;
-  doc["profile"] = profileNames[activeIndex];
-
-  if (ph < 0)
-    doc["ph"] = nullptr;
-  else
-    doc["ph"] = ph;
-  if (tds < 0)
-    doc["tds"] = nullptr;
-  else
-    doc["tds"] = tds;
-  if (light < 0)
-    doc["light"] = nullptr;
-  else
-    doc["light"] = light;
-  if (temp < 0)
-    doc["temp"] = nullptr;
-  else
-    doc["temp"] = temp;
-
-  doc["status"]["ph_ok"] =
-      (ph >= 0) && (ph >= current->ph_min) && (ph <= current->ph_max);
-  doc["status"]["tds_ok"] =
-      (tds >= 0) && (tds >= current->tds_min) && (tds <= current->tds_max);
-  doc["status"]["light_ok"] = (light >= 0) && (light >= current->lux_min) &&
-                              (light <= current->lux_max);
-  doc["status"]["temp_ok"] = (temp >= 0);
-
-  doc["sensors"]["ph_connected"] = (ph >= 0);
-  doc["sensors"]["tds_connected"] = (tds >= 0);
-  doc["sensors"]["light_connected"] = (light >= 0);
-  doc["sensors"]["temp_connected"] = (temp >= 0);
-
-  doc["actuators"]["pump1"]["state"] = pump1.state ? "on" : "off";
-  doc["actuators"]["pump1"]["mode"] = pump1.manual ? "manual" : "auto";
-  doc["actuators"]["pump2"]["state"] = pump2.state ? "on" : "off";
-  doc["actuators"]["pump2"]["mode"] = pump2.manual ? "manual" : "auto";
-  doc["actuators"]["diluted_pump"]["state"] = dilutedPump.state ? "on" : "off";
-  doc["actuators"]["diluted_pump"]["mode"] =
-      dilutedPump.manual ? "manual" : "auto";
-  doc["actuators"]["led"]["state"] = led.state ? "on" : "off";
-  doc["actuators"]["led"]["mode"] = led.manual ? "manual" : "auto";
-
-  String output;
-  serializeJson(doc, output);
-  webSocket.sendTXT(output);
-  Serial.println("[SEND] " + output);
+void writeActuator(const char *name, ActuatorState &s, bool on, uint8_t pin) {
+  if (s.state == on) return;
+  s.state = on;
+  digitalWrite(pin, on ? PUMP_ON : PUMP_OFF);
+  sendActuatorStatus(name, on);
 }
 
-// ── Automation ────────────────────────────────────────────────
-void runAutomation(float ph, float tds, float light) {
-  if (!pump1.manual) {
-    pump1.state = true;
-    applyActuator(pump1);
-  }
-  if (!pump2.manual) {
-    pump2.state = true;
-    applyActuator(pump2);
-  }
+void runAutomation() {
+  const SystemSetpoints &sys = SYSTEMS[activeSystemIndex];
+  const PhSimProfile &phProf = PH_SIM[activeSystemIndex];
+  float ph = simPH[activeSystemIndex];
+  int tds = readTDS();
+  int lux = readLux();
 
-  if (!dilutedPump.manual) {
-    bool phOOR = (ph >= 0) && (ph < current->ph_min || ph > current->ph_max);
-    bool tdsOOR =
-        (tds >= 0) && (tds < current->tds_min || tds > current->tds_max);
-    bool fire = ((ph >= 0) || (tds >= 0)) && (phOOR || tdsOOR);
-    dilutedPump.state = fire;
-    applyActuator(dilutedPump);
-    if (fire) {
-      Serial.print("[AUTO] Diluted pump ON — ");
-      if (phOOR) {
-        Serial.print("pH=");
-        Serial.print(ph);
-        Serial.print(" ");
-      }
-      if (tdsOOR) {
-        Serial.print("TDS=");
-        Serial.print(tds);
-      }
-      Serial.println();
+  // 1. Determine if Pumps are needed (pH too low OR TDS out of range)
+  bool phTooLow = (ph < phProf.lowPH);
+  bool tdsDev   = (tds < sys.tdsMin || tds > sys.tdsMax);
+  bool needsPumps = phTooLow || tdsDev;
+
+  // --- Pump 6V & 12V Automation ---
+  auto applyPump = [&](const char* name, ActuatorState &s, uint8_t pin) {
+    if (needsPumps) {
+      // If we need pumps and they aren't manually silenced, turn them ON
+      if (!s.silenced) writeActuator(name, s, true, pin);
+    } else {
+      // System is in equilibrium
+      s.silenced = false; // Reset manual silence
+      if (!s.manual) writeActuator(name, s, false, pin);
     }
-  }
+  };
 
-  if (!led.manual && light >= 0) {
-    if (light < current->lux_min) {
-      led.state = true;
-      Serial.print("[AUTO] LED ON  lux=");
-      Serial.println(light);
-    } else if (light > current->lux_max) {
-      led.state = false;
-      Serial.print("[AUTO] LED OFF lux=");
-      Serial.println(light);
-    }
-    applyActuator(led);
-  }
-}
+  applyPump("pump6v", pump6v, PIN_PUMP_6V);
+  applyPump("pump12v", pump12v, PIN_PUMP_12V);
 
-// ── WebSocket event handler ───────────────────────────────────
-void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
-  switch (type) {
-  case WStype_CONNECTED:
-    wsConnected = true;
-    Serial.println("[WS] Connected to backend");
-    webSocket.sendTXT("{\"type\":\"identify\",\"device\":\"esp32-aqualoop\","
-                      "\"firmware\":\"3.0\"}");
-    sendActuatorStatus();
-    break;
-
-  case WStype_DISCONNECTED:
-    wsConnected = false;
-    Serial.println("[WS] Disconnected from backend");
-    break;
-
-  case WStype_TEXT: {
-    StaticJsonDocument<512> cmd;
-    if (deserializeJson(cmd, payload, length))
-      break;
-    const char *msgType = cmd["type"];
-    if (!msgType)
-      break;
-
-    if (strcmp(msgType, "actuator_command") == 0) {
-      const char *id = cmd["actuator"];
-      const char *state = cmd["state"];
-      const char *mode = cmd["mode"];
-      if (!id || !state)
-        break;
-      Actuator *a = getActuatorByName(id);
-      if (!a)
-        break;
-      a->state = (strcmp(state, "on") == 0);
-      a->manual = (mode && strcmp(mode, "manual") == 0);
-      applyActuator(*a);
-      Serial.printf("[CMD] %s → %s %s\n", id, a->state ? "ON" : "OFF",
-                    a->manual ? "MANUAL" : "AUTO");
-      sendActuatorStatus();
-      break;
-    }
-
-    if (strcmp(msgType, "set_profile") == 0) {
-      const char *p = cmd["profile"];
-      if (!p)
-        break;
-      for (int i = 0; i < 3; i++) {
-        if (strcmp(p, profileNames[i]) == 0) {
-          activeIndex = i;
-          current = &profiles[i];
-          Serial.print("[PROFILE] → ");
-          Serial.println(profileNames[i]);
-          StaticJsonDocument<128> ack;
-          ack["type"] = "profile_switched";
-          ack["profile"] = profileNames[i];
-          ack["system"] = i;
-          String s;
-          serializeJson(ack, s);
-          webSocket.sendTXT(s);
-          break;
-        }
-      }
-      break;
-    }
-
-    if (strcmp(msgType, "set_setpoints") == 0) {
-      if (cmd.containsKey("ph_min"))
-        current->ph_min = cmd["ph_min"];
-      if (cmd.containsKey("ph_max"))
-        current->ph_max = cmd["ph_max"];
-      if (cmd.containsKey("tds_min"))
-        current->tds_min = cmd["tds_min"];
-      if (cmd.containsKey("tds_max"))
-        current->tds_max = cmd["tds_max"];
-      if (cmd.containsKey("lux_min"))
-        current->lux_min = cmd["lux_min"];
-      if (cmd.containsKey("lux_max"))
-        current->lux_max = cmd["lux_max"];
-      Serial.printf("[SETPOINTS] pH %.2f–%.2f TDS %.0f–%.0f Lux %.0f–%.0f\n",
-                    current->ph_min, current->ph_max, current->tds_min,
-                    current->tds_max, current->lux_min, current->lux_max);
-      StaticJsonDocument<256> ack;
-      ack["type"] = "setpoints_updated";
-      ack["profile"] = profileNames[activeIndex];
-      ack["ph_min"] = current->ph_min;
-      ack["ph_max"] = current->ph_max;
-      ack["tds_min"] = current->tds_min;
-      ack["tds_max"] = current->tds_max;
-      ack["lux_min"] = current->lux_min;
-      ack["lux_max"] = current->lux_max;
-      String s;
-      serializeJson(ack, s);
-      webSocket.sendTXT(s);
-      break;
-    }
-
-    if (strcmp(msgType, "set_calibration") == 0) {
-      if (cmd.containsKey("ph_v4"))
-        PH_VOLTAGE_AT_4 = cmd["ph_v4"];
-      if (cmd.containsKey("ph_v7"))
-        PH_VOLTAGE_AT_7 = cmd["ph_v7"];
-      if (cmd.containsKey("tds_factor"))
-        TDS_CALIBRATION_FACTOR = cmd["tds_factor"];
-      Serial.printf("[CAL] pH V@4=%.3f V@7=%.3f TDS=%.3f\n", PH_VOLTAGE_AT_4,
-                    PH_VOLTAGE_AT_7, TDS_CALIBRATION_FACTOR);
-      StaticJsonDocument<128> ack;
-      ack["type"] = "calibration_updated";
-      ack["ph_v4"] = PH_VOLTAGE_AT_4;
-      ack["ph_v7"] = PH_VOLTAGE_AT_7;
-      ack["tds_factor"] = TDS_CALIBRATION_FACTOR;
-      String s;
-      serializeJson(ack, s);
-      webSocket.sendTXT(s);
-      break;
-    }
-
-    if (strcmp(msgType, "ping") == 0) {
-      webSocket.sendTXT("{\"type\":\"pong\"}");
-      break;
-    }
-    break;
-  }
-  default:
-    break;
-  }
-}
-
-// ── Setup ─────────────────────────────────────────────────────
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\n==============================");
-  Serial.println(" AquaLoop Firmware v3.0");
-  Serial.println(" Real Sensor Mode");
-  Serial.println("==============================");
-
-  pinMode(PUMP_1_PIN, OUTPUT);
-  digitalWrite(PUMP_1_PIN, RELAY_OFF);
-  pinMode(PUMP_2_PIN, OUTPUT);
-  digitalWrite(PUMP_2_PIN, RELAY_OFF);
-  pinMode(DILUTED_PUMP_PIN, OUTPUT);
-  digitalWrite(DILUTED_PUMP_PIN, RELAY_OFF);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, RELAY_OFF);
-  Serial.println("[INIT] Relays OFF");
-
-  Wire.begin(21, 22);
-  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
-    Serial.println("[INIT] BH1750 OK");
-  else
-    Serial.println("[INIT] BH1750 FAILED — check SDA/SCL wiring");
-
-  tempSensor.begin();
-  if (tempSensor.getDeviceCount() > 0) {
-    tempSensor.setResolution(9);
-    Serial.println("[INIT] DS18B20 OK");
+  // 2. Determine if LED is needed (Light too low)
+  bool luxTooLow = (lux < sys.luxMin);
+  
+  if (luxTooLow) {
+    if (!led.manual) writeActuator("led", led, true, PIN_LED);
   } else {
-    Serial.println("[INIT] DS18B20 NOT FOUND — check GPIO4 + 4.7k pullup");
+    if (!led.manual) writeActuator("led", led, false, PIN_LED);
   }
-
-  while (!connectWiFi()) {
-    Serial.println("[WiFi] Retrying in 5 seconds...");
-    delay(5000);
-  }
-
-  webSocket.beginSSL(SERVER_HOST, SERVER_PORT,
-                     SERVER_PATH); // Use beginSSL for Cloudflare internet URLs
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(3000);
-  webSocket.enableHeartbeat(25000, 3000, 2);
 }
 
-// ── Loop ──────────────────────────────────────────────────────
-void loop() {
-  webSocket.loop();
+// ─── PH SIMULATION LOGIC ────────────────────────────────────
+void updatePhSimulation() {
+  unsigned long now = millis();
+  float dtSec = (now - lastPhUpdate) / 1000.0f;
+  lastPhUpdate = now;
+  if (dtSec > 10.0f) dtSec = 0;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Lost connection — reconnecting...");
-    wsConnected = false;
-    while (!connectWiFi()) {
-      Serial.println("[WiFi] Retrying in 5 seconds...");
-      delay(5000);
+  for (int i = 0; i < 3; i++) {
+    const PhSimProfile &p = PH_SIM[i];
+    if (currentPhase[i] == DECREASING) {
+      simPH[i] -= p.rateDec * dtSec;
+      if (simPH[i] <= p.lowPH) {
+        simPH[i] = p.lowPH;
+        currentPhase[i] = INCREASING;
+      }
+    } else {
+      // INCREASING
+      bool pumpsOn = (i == activeSystemIndex) ? (pump6v.state || pump12v.state) : true;
+      if (pumpsOn) simPH[i] += p.rateInc * dtSec;
+      else simPH[i] -= p.rateDec * dtSec;
+
+      if (simPH[i] >= p.highPH) {
+        simPH[i] = p.highPH;
+        currentPhase[i] = DECREASING;
+      }
     }
-    webSocket.beginSSL(
-        SERVER_HOST, SERVER_PORT,
-        SERVER_PATH); // Use beginSSL for Cloudflare internet URLs
   }
+}
 
-  static unsigned long lastSensor = 0;
-  if (millis() - lastSensor >= SENSOR_INTERVAL_MS && wsConnected) {
-    lastSensor = millis();
-    float ph = readPH();
-    float tds = readTDS();
-    float light = readLight();
-    float temp = readTemperature();
+void handleIncoming(const String &input) {
+  StaticJsonDocument<512> cmd;
+  if (deserializeJson(cmd, input)) return;
+  const char *type = cmd["type"] | "";
 
-    Serial.println("────────────────────────");
-    Serial.print("[pH]    ");
-    ph < 0 ? Serial.println("DISCONNECTED")
-           : (Serial.print(ph, 2), Serial.println(" pH"));
-    Serial.print("[TDS]   ");
-    tds < 0 ? Serial.println("DISCONNECTED")
-            : (Serial.print(tds, 1), Serial.println(" ppm"));
-    Serial.print("[Lux]   ");
-    light < 0 ? Serial.println("DISCONNECTED")
-              : (Serial.print(light, 1), Serial.println(" lux"));
-    Serial.print("[Temp]  ");
-    temp < 0 ? Serial.println("DISCONNECTED")
-             : (Serial.print(temp, 2), Serial.println(" °C"));
-    Serial.print("[Profile] ");
-    Serial.println(profileNames[activeIndex]);
+  if (strcmp(type, "identify_ack") == 0) {
+    identified = true;
+    sendActuatorStatus("pump6v", pump6v.state);
+    sendActuatorStatus("pump12v", pump12v.state);
+    sendActuatorStatus("led", led.state);
+  } else if (strcmp(type, "set_profile") == 0) {
+    const char* prof = cmd["profile"] | "main";
+    for(int i=0; i<3; i++) {
+      if(strcmp(SYSTEMS[i].id, prof) == 0) {
+        activeSystemIndex = i;
+        triggerCycle = true;
+        break;
+      }
+    }
+  } else if (strcmp(type, "actuator_command") == 0) {
+    const char *act = cmd["actuator"] | "";
+    const char *state = cmd["state"] | "off";
+    const char *mode = cmd["mode"] | "auto";
+    bool on = (strcmp(state, "on") == 0);
+    bool isMan = (strcmp(mode, "manual") == 0);
+    bool isDev = (currentPhase[activeSystemIndex] == INCREASING);
 
-    runAutomation(ph, tds, light);
-    sendSensorReading(ph, tds, light, temp);
+    if (strcmp(act, "pump6v") == 0) {
+      pump6v.manual = isMan;
+      if (isDev && !on) pump6v.silenced = true;
+      else if (on) pump6v.silenced = false;
+      writeActuator("pump6v", pump6v, on, PIN_PUMP_6V);
+    } else if (strcmp(act, "pump12v") == 0) {
+      pump12v.manual = isMan;
+      if (isDev && !on) pump12v.silenced = true;
+      else if (on) pump12v.silenced = false;
+      writeActuator("pump12v", pump12v, on, PIN_PUMP_12V);
+    } else if (strcmp(act, "led") == 0) {
+      led.manual = isMan;
+      writeActuator("led", led, on, PIN_LED);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(BAUD_RATE);
+  Serial.setRxBufferSize(2048); // Ensure we don't miss incoming commands
+  pinMode(PIN_PUMP_6V, OUTPUT); pinMode(PIN_PUMP_12V, OUTPUT); pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_PUMP_6V, PUMP_OFF); digitalWrite(PIN_PUMP_12V, PUMP_OFF); digitalWrite(PIN_LED, LED_OFF);
+
+  for(int i=0; i<3; i++) { simPH[i] = PH_SIM[i].startPH; }
+  lastPhUpdate = millis();
+  delay(2000); // Give server time to connect
+  Serial.print("{\"type\":\"identify\",\"device\":\"AquaLoop_ESP32\"}\r\n");
+}
+
+void loop() {
+  updatePhSimulation();
+  while (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() > 0) handleIncoming(input);
+  }
+  if (millis() - lastSendTime >= SEND_INTERVAL || triggerCycle) {
+    lastSendTime = millis(); triggerCycle = false;
+    StaticJsonDocument<512> doc;
+    doc["type"] = "sensor_reading";
+    doc["profile"] = SYSTEMS[activeSystemIndex].id;
+    doc["ph"] = serialized(String(simPH[activeSystemIndex], 2));
+    doc["tds"] = readTDS();
+    doc["light"] = readLux();
+    doc["phase"] = (currentPhase[activeSystemIndex] == INCREASING) ? "correction" : "drift";
+    serializeJson(doc, Serial);
+    Serial.print("\r\n"); // Explicitly send the delimiter the server expects
+    runAutomation();
   }
 }
